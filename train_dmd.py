@@ -58,16 +58,18 @@ def generate_paired_data(teacher, diffusion, cfg, num_pairs=10000):
                 sqrt_one_minus_alpha_bar_t_prev = torch.sqrt(1 - alpha_bar_t_prev + 1e-8)
 
                 # 1. 模型预测 x0
-                pred_x0 = teacher(x, t_tensor)
+                pred_noise = teacher(x, t_tensor)
+                #pred_x0 = teacher(x, t_tensor)
+                pred_x0 = (x - sqrt_one_minus_alpha_bar_t * pred_noise) / (sqrt_alpha_bar_t + 1e-8)
 
                 # 2. 计算噪声方向 (direction pointing to x_t)
                 # 公式: epsilon_theta = (x_t - sqrt(alpha_bar_t) * pred_x0) / sqrt(1 - alpha_bar_t)
                 # 这一步本质是在估算当前的噪声成分
-                dir_xt = (x - sqrt_alpha_bar_t * pred_x0) / sqrt_one_minus_alpha_bar_t
+                #dir_xt = (x - sqrt_alpha_bar_t * pred_x0) / sqrt_one_minus_alpha_bar_t
 
                 # 3. 计算 x_{t-1} (确定性更新, sigma_t = 0)
                 # 公式: x_{t-1} = sqrt(alpha_bar_{t-1}) * pred_x0 + sqrt(1 - alpha_bar_{t-1}) * dir_xt
-                x = sqrt_alpha_bar_t_prev * pred_x0 + sqrt_one_minus_alpha_bar_t_prev * dir_xt
+                x = sqrt_alpha_bar_t_prev * pred_x0 + sqrt_one_minus_alpha_bar_t_prev * pred_noise
 
 
             paired_z.append(z.cpu())
@@ -114,7 +116,7 @@ def train_dmd(cfg, teacher, diffusion):
         paired_y = paired_data['y'].to(cfg.device)
     else:
         print("Generating paired data...")
-        paired_z, paired_y = generate_paired_data(teacher, diffusion, cfg, num_pairs=10000)
+        paired_z, paired_y = generate_paired_data(teacher, diffusion, cfg, cfg.paired_data_size)
         paired_z = paired_z.to(cfg.device)
         paired_y = paired_y.to(cfg.device)
     
@@ -135,8 +137,8 @@ def train_dmd(cfg, teacher, diffusion):
     G = Generator(
         z_dim=cfg.data_dim,          # 噪声维度与数据一致
         output_dim=cfg.data_dim,
-        hidden_dim=cfg.hidden_dim*2,
-        num_layers=cfg.num_layers
+        hidden_dim=cfg.hidden_dim,
+        num_layers=10
     ).to(cfg.device)
  
     D = Discriminator(
@@ -209,7 +211,6 @@ def train_dmd(cfg, teacher, diffusion):
             opt_D.zero_grad()
             loss_D.backward()
             opt_D.step()
-            scheduler_D.step()
         
         # --- 更新生成器 G ---
         G.train()
@@ -225,29 +226,32 @@ def train_dmd(cfg, teacher, diffusion):
         # 对 x_fake 加噪
         x_t, _ = diffusion.q_sample(x_fake, t)
 
-        with torch.no_grad():
+        #with torch.no_grad():
             # 教师预测
-            pred_real = teacher(x_t, t)
+         #   pred_real = teacher(x_t, t)
             # fake 模型预测
-            pred_fake = fake_model(x_t, t)
+          #  pred_fake = fake_model(x_t, t)
 
         # 计算 score
         alpha_t, sigma_t_sq = diffusion.get_alpha_sigma(t)   # (batch,1)
-        s_real = -(x_t - alpha_t * pred_real) / sigma_t_sq
-        s_fake = -(x_t - alpha_t * pred_fake) / sigma_t_sq
-
+        #s_real = -(x_t - alpha_t * pred_real) / sigma_t_sq
+        #s_fake = -(x_t - alpha_t * pred_fake) / sigma_t_sq
+        s_real = teacher(x_t, t)
+        s_fake = fake_model(x_t,t)
         # 梯度因子 (公式7)
         grad_factor = cfg.w_t * alpha_t * (s_fake - s_real).detach()   # (batch, dim)
         # 构造损失使得 dL/dx_fake = grad_factor
-        with torch.no_grad():
-            p_fake = torch.sigmoid(D(x_t.detach(),t))
-            ratio = torch.pow((1 - p_fake) / p_fake,cfg.div_alpha)
-            ratio = torch.clamp(ratio, min=0.1, max=10.0) # 截断到 [0.1, 10]
-
+        if cfg.enable_f_div==True:
+            with torch.no_grad():
+                p_fake = torch.sigmoid(D(x_t.detach(),t))
+                ratio = torch.pow((1 - p_fake) / p_fake,cfg.div_alpha)
+                ratio = torch.clamp(ratio, min=0.1, max=10.0) # 截断到 [0.1, 10]
         #print(ratio.shape, grad_factor.shape, x_fake.shape)
-        ratio=ratio.view(-1,1)
-        loss_kl = (ratio*grad_factor * x_fake).sum() / cfg.batch_size
-    
+            ratio=ratio.view(-1,1)
+            loss_kl = (ratio*grad_factor * x_fake).sum() / cfg.batch_size
+        else :
+            loss_kl = (grad_factor * x_fake).sum() / cfg.batch_size
+            
         # 在生成器更新部分
         try:
             z_ref, y_ref = next(paired_iter)
@@ -278,13 +282,13 @@ def train_dmd(cfg, teacher, diffusion):
         x_t_fake, _ = diffusion.q_sample(x_fake, t)
         logits_fake = D(x_t_fake, t)  # 注意这里 D 的参数固定（不更新）
         loss_adv = -torch.log(torch.sigmoid(logits_fake) + 1e-8).mean()
-        total_loss_G = loss_kl + loss_adv + cfg.lambda_reg * loss_reg 
+        #total_loss_G = loss_kl # + loss_adv + cfg.lambda_reg * loss_reg 
+        total_loss_G = loss_kl + cfg.lambda_reg * loss_reg 
         
         opt_G.zero_grad()
         total_loss_G.backward()
         torch.nn.utils.clip_grad_norm_(G.parameters(), max_norm=1.0)
         opt_G.step()
-        scheduler_G.step()
         # 计算一个可监控的代理指标（例如生成样本的方差）
         with torch.no_grad():
             z_test = torch.randn(100, cfg.data_dim, device=cfg.device)
@@ -310,13 +314,16 @@ def train_dmd(cfg, teacher, diffusion):
             pred = fake_model(x_t_fake, t_fake)
 
             # denoising loss (公式6)
-            loss_fake = mse(pred, x_fake_detach)
+            loss_fake = mse(pred, noise)
 
             opt_fake.zero_grad()
             loss_fake.backward()
             torch.nn.utils.clip_grad_norm_(fake_model.parameters(), max_norm=1.0)
             opt_fake.step()
-            scheduler_fake.step()
+        
+        scheduler_fake.step()
+        scheduler_D.step()
+        scheduler_G.step()
         if epoch % 20 == 0:
             print(f"DMD Epoch {epoch}, Sample var: {sample_var:.4f}, Loss: {total_loss_G.item():.4f}")
 
